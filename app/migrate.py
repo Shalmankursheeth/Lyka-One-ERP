@@ -1,27 +1,24 @@
 """
-Migration runner.
+Migration runner. R6: one transaction for the whole run. One COMMIT at the end.
 
-R3: migration_outcomes is the resume cursor. Kill mid-run; restart; skip
-legacy_ids already decided. Three complete runs match one.
+Kill before COMMIT → full rollback. R3 is restart-and-converge: run the source
+again; writes are idempotent; final state matches an uninterrupted run.
 
-R6 is per row (one transaction per legacy_id), not one transaction for the
-whole run — see NOTES.md Q4.
-
-The T0 snapshot lives in Python. The T2 write uses a new SQLite session
-opened after the delay, so a live edit committed on another connection is
-visible (a long-lived WAL snapshot would hide it).
-
-CLI:
-    python -m app.migrate --batch-size 1 [--delay-seconds 3]
+--batch-size / --delay-seconds only control the T0/T2 sleep window (how often
+we pause so a live writer can commit on another connection). They are not
+commit boundaries.
 """
 import argparse
 import json
 import time
 from datetime import datetime, timezone
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 from app.db import get_session
-from app.models import LeadLegacy, MigrationOutcome, MigrationWarning, Quarantine, MigrationCursor, Agent
+from app.models import (
+    Agent, LeadLegacy, MigrationCursor, MigrationOutcome,
+    MigrationWarning, Quarantine,
+)
 from app.normalize import (
     normalize_name, normalize_phone, normalize_deal_value,
     normalize_date_to_dubai, normalize_status, to_utc_naive, NormalizationError,
@@ -63,108 +60,119 @@ def normalize_legacy_row(row: LeadLegacy, valid_agent_ids: set):
     ), warnings
 
 
+def _record_outcome(session, legacy_id, outcome, lead_id, now):
+    row = session.get(MigrationOutcome, legacy_id)
+    if row is None:
+        session.add(MigrationOutcome(
+            legacy_id=legacy_id, outcome=outcome, lead_id=lead_id, detected_at=now,
+        ))
+    else:
+        row.outcome = outcome
+        row.lead_id = lead_id
+        row.detected_at = now
+
+
+def _record_quarantine(session, legacy_id, raw, reason, now):
+    existing = session.execute(
+        select(Quarantine).where(Quarantine.legacy_id == legacy_id)
+    ).scalar_one_or_none()
+    if existing is None:
+        session.add(Quarantine(
+            legacy_id=legacy_id, raw_row=json.dumps(raw), reason=reason, detected_at=now,
+        ))
+    else:
+        existing.raw_row = json.dumps(raw)
+        existing.reason = reason
+        existing.detected_at = now
+
+
 def run_migration(batch_size: int = 50, delay_seconds: float = 0.0, limit: int = None,
                    crash_after_batches: int = None, pre_write_hook=None):
-    read = get_session()
-    already_done = {r[0] for r in read.execute(select(MigrationOutcome.legacy_id)).all()}
-    valid_agent_ids = {r[0] for r in read.execute(select(Agent.agent_id)).all()}
-    ids = [r[0] for r in read.execute(select(LeadLegacy.id).order_by(LeadLegacy.id)).all()]
-    read.close()
-    if limit:
-        ids = ids[:limit]
-    pending = [i for i in ids if i not in already_done]
+    session = get_session()
+    summary = {"migrated": 0, "merged": 0, "quarantined": 0, "skipped_already_done": 0}
+    processed_in_batch = 0
+    batches_seen = 0
 
-    summary = {
-        "migrated": 0, "merged": 0, "quarantined": 0,
-        "skipped_already_done": len(ids) - len(pending),
-    }
-    batches_committed = 0
-    pending_in_batch = 0
+    try:
+        valid_agent_ids = {r[0] for r in session.execute(select(Agent.agent_id)).all()}
+        ids = [r[0] for r in session.execute(select(LeadLegacy.id).order_by(LeadLegacy.id)).all()]
+        if limit:
+            ids = ids[:limit]
 
-    for legacy_id in pending:
-        # --- T0: snapshot on a short-lived read session, then close it ---
-        snap = get_session()
-        row = snap.get(LeadLegacy, legacy_id)
-        raw = _row_to_dict(row)
-        try:
-            candidate, warnings = normalize_legacy_row(row, valid_agent_ids)
-            quarantine_reason = None
-        except NormalizationError as e:
-            candidate, warnings = None, []
-            quarantine_reason = e.reason
-        snap.close()
+        for legacy_id in ids:
+            row = session.get(LeadLegacy, legacy_id)
+            raw = _row_to_dict(row)
+            now = to_utc_naive(datetime.now(timezone.utc))
+            try:
+                candidate, warnings = normalize_legacy_row(row, valid_agent_ids)
+                quarantine_reason = None
+            except NormalizationError as e:
+                candidate, warnings = None, []
+                quarantine_reason = e.reason
 
-        if delay_seconds:
-            time.sleep(delay_seconds)
-        if pre_write_hook and candidate is not None:
-            pre_write_hook(row, candidate)
+            # T0 snapshot is `candidate` / `raw` in Python. Sleep without COMMIT.
+            processed_in_batch += 1
+            if delay_seconds and processed_in_batch >= batch_size:
+                time.sleep(delay_seconds)
+                processed_in_batch = 0
+                batches_seen += 1
 
-        # --- T2: fresh write session, sees live commits from other processes ---
-        now = to_utc_naive(datetime.now(timezone.utc))
-        write = get_session()
-        try:
+            if pre_write_hook and candidate is not None:
+                pre_write_hook(row, candidate)
+
+            # See live commits from other connections (Postgres READ COMMITTED).
+            session.expire_all()
+
             if quarantine_reason:
-                write.add(Quarantine(
-                    legacy_id=legacy_id,
-                    raw_row=json.dumps(raw),
-                    reason=quarantine_reason,
-                    detected_at=now,
-                ))
-                write.add(MigrationOutcome(
-                    legacy_id=legacy_id, outcome="quarantined", lead_id=None, detected_at=now,
-                ))
+                _record_quarantine(session, legacy_id, raw, quarantine_reason, now)
+                _record_outcome(session, legacy_id, "quarantined", None, now)
                 summary["quarantined"] += 1
             else:
-                outcome, lead_id, displaced = write_candidate_lead(write, now=now, **candidate)
+                outcome, lead_id, displaced = write_candidate_lead(session, now=now, **candidate)
+                session.execute(delete(MigrationWarning).where(MigrationWarning.legacy_id == legacy_id))
                 for w in warnings:
-                    write.add(MigrationWarning(legacy_id=legacy_id, warning=w, detected_at=now))
+                    session.add(MigrationWarning(legacy_id=legacy_id, warning=w, detected_at=now))
                 if outcome == WriteOutcome.MERGED_LOSER:
-                    write.add(MigrationOutcome(
-                        legacy_id=legacy_id, outcome="merged", lead_id=lead_id, detected_at=now,
-                    ))
+                    _record_outcome(session, legacy_id, "merged", lead_id, now)
                     summary["merged"] += 1
                 else:
-                    write.add(MigrationOutcome(
-                        legacy_id=legacy_id, outcome="migrated", lead_id=lead_id, detected_at=now,
-                    ))
+                    _record_outcome(session, legacy_id, "migrated", lead_id, now)
                     summary["migrated"] += 1
                 if displaced:
-                    prior = write.get(MigrationOutcome, displaced)
-                    if prior is not None:
-                        prior.outcome = "merged"
+                    _record_outcome(session, displaced, "merged", lead_id, now)
+                    if summary["migrated"] > 0:
                         summary["migrated"] -= 1
                         summary["merged"] += 1
 
-            cursor = write.get(MigrationCursor, 1)
+            cursor = session.get(MigrationCursor, 1)
             if cursor is None:
                 cursor = MigrationCursor(id=1, rows_processed=0)
-                write.add(cursor)
+                session.add(cursor)
             cursor.last_legacy_id = legacy_id
             cursor.rows_processed = (cursor.rows_processed or 0) + 1
             cursor.updated_at = now
-            write.commit()
-        except Exception:
-            write.rollback()
-            raise
-        finally:
-            write.close()
 
-        pending_in_batch += 1
-        if pending_in_batch >= batch_size:
-            batches_committed += 1
-            pending_in_batch = 0
-            if crash_after_batches is not None and batches_committed >= crash_after_batches:
-                raise SystemExit(f"simulated crash after {batches_committed} batch(es)")
+            if crash_after_batches is not None and batches_seen >= crash_after_batches:
+                raise SystemExit(f"simulated crash after {batches_seen} batch(es), before COMMIT")
 
-    return summary
+        session.commit()
+        return summary
+    except BaseException:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def main():
     ap = argparse.ArgumentParser(description="Lyka One migration runner")
-    ap.add_argument("--batch-size", type=int, default=50)
+    ap.add_argument(
+        "--batch-size", type=int, default=50,
+        help="rows between delay sleeps (NOT a commit size; R6 is one transaction)",
+    )
     ap.add_argument(
         "--delay-seconds", type=float, default=0.0,
-        help="sleep after reading each row and before writing it (R5 window)",
+        help="sleep after every --batch-size rows, still inside the open transaction",
     )
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--crash-after-batches", type=int, default=None)

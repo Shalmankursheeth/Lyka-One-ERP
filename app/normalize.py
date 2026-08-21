@@ -1,6 +1,7 @@
 """R1 — normalise or raise NormalizationError with an operator-readable reason."""
 import re
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 
 DUBAI_TZ = timezone(timedelta(hours=4))
 STATUS_ENUM = {"New", "Qualified", "Booked", "Closed Won", "Lost"}
@@ -80,7 +81,8 @@ def normalize_deal_value(raw: str):
     cleaned = cleaned.replace(",", "").strip()
     if not re.fullmatch(r"\d+(\.\d{1,2})?", cleaned):
         raise NormalizationError(f"deal_value '{raw}' is not a recognisable amount")
-    return round(float(cleaned) * 100)
+    fils = (Decimal(cleaned) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(fils)
 
 
 def normalize_date_to_dubai(raw: str) -> datetime:

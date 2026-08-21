@@ -1,9 +1,9 @@
 """
 Schema for the Lyka One cutover.
 
-Target tables match the brief. Extra tables exist only so R3 (resume) and
-R4 (merged-row provenance) are possible without mutating leads.legacy_id
-uniqueness or dropping a losing duplicate.
+Target tables match the brief. Extra tables exist so R4 (merged-row
+provenance) and operator-facing outcomes are possible without dropping a
+losing duplicate. They are written in the same R6 transaction as the leads.
 """
 from sqlalchemy import (
     Column, String, Integer, BigInteger, Text, DateTime,
@@ -70,7 +70,7 @@ class Quarantine(Base):
 
 
 class MigrationOutcome(Base):
-    """Idempotency ledger: presence means this legacy_id was already decided."""
+    """Written in the same R6 transaction. Not a durable resume checkpoint."""
     __tablename__ = "migration_outcomes"
 
     legacy_id = Column(String, primary_key=True)

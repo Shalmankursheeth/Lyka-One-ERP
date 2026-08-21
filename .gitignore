@@ -11,3 +11,5 @@ _cutover_data/
 .vscode/
 collision_migrate*.log
 collision_migrate.pid
+collision_*.txt
+kill_*.txt

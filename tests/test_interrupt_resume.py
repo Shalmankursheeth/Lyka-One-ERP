@@ -1,4 +1,4 @@
-"""R3: crash mid-run then resume; three full runs stay identical."""
+"""R3: kill rolls the single R6 transaction back; restart converges."""
 import os
 import subprocess
 import sys
@@ -28,7 +28,7 @@ def _migrate(extra):
     )
 
 
-def test_kill_mid_run_then_resume_converges():
+def test_kill_mid_run_rolls_back_then_restart_converges():
     _clean()
     _migrate(["--batch-size", "50"])
     reference = build_reconciliation_report()
@@ -46,7 +46,9 @@ def test_kill_mid_run_then_resume_converges():
     proc.wait(timeout=5)
 
     partial = build_reconciliation_report()
-    assert 0 < partial["total_accounted_for"] < 12
+    assert partial["total_accounted_for"] == 0, (
+        f"R6 violated: kill left {partial['total_accounted_for']} durable rows"
+    )
 
     _migrate(["--batch-size", "50"])
     resumed = build_reconciliation_report()

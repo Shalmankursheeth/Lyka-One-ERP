@@ -1,8 +1,8 @@
 # Lyka One — the cutover (revised 3-hour brief)
 
-Python + FastAPI + SQLAlchemy + SQLite. No Postgres daemon. Reviewer can clone, install, and run the collision on a laptop.
+Python + FastAPI + SQLAlchemy + **PostgreSQL**. SQLite is allowed by the brief, but it cannot honestly do R5 inside R6: one migration transaction takes the only writer lock, so a live update either blocks until COMMIT or never interleaves. Postgres READ COMMITTED lets the live write commit while the backfill transaction is still open. That is the collision the evaluator will run.
 
-This is the **revised 3-hour** scope: schemas + seed, resumable migration, one live write path into the new schema, reconciliation. Not in this repo (deliberately cut): dual-write proxy, cutover runbook, TIMELOG.
+Scope: migration runner, one live write into the new schema, reconciliation, README, NOTES Q1–Q4. No dual-write proxy, runbook, or backlog.
 
 ## Setup
 
@@ -12,7 +12,10 @@ cd Lyka-One-ERP
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+docker compose up -d --wait
 ```
+
+Default URL: `postgresql+psycopg://lyka:lyka@127.0.0.1:5433/lyka` (compose maps 5433 → 5432). Override with `DATABASE_URL` if needed.
 
 ## Reset to clean (we will use this repeatedly)
 
@@ -20,32 +23,33 @@ pip install -r requirements.txt
 python -m app.reset
 ```
 
-That drops every table, recreates the schema, and seeds 5 agents + 12 legacy leads. Row 1009's name is seeded with a real U+00A0.
+Drops every table, recreates the schema, seeds 5 agents + 12 legacy leads. Row 1009's name is a real U+00A0.
 
 ## 1. Migration runner
 
-```powershell
-python -m app.reset
-python -m app.migrate --batch-size 1
-```
-
-`--batch-size` is the commit boundary. `--delay-seconds` injects sleep **after the legacy row is snapshotted and before it is written** — that is the T0/T2 window.
-
-Interrupt and resume:
+R6: the whole run is **one transaction**. `--batch-size` is only how many rows between delay sleeps. It is not a commit size.
 
 ```powershell
 python -m app.reset
-python -m app.migrate --batch-size 1 --delay-seconds 2
-# Ctrl+C (or kill the process) after a few rows print / after a few seconds
 python -m app.migrate --batch-size 1
 python -m app.reconcile
 ```
 
-The second run skips `legacy_id`s already in `migration_outcomes` and converges to the same ledger as an uninterrupted run.
+Interrupt and restart (R3 = restart-and-converge, not checkpoint resume):
+
+```powershell
+python -m app.reset
+python -m app.migrate --batch-size 1 --delay-seconds 2
+# kill the process after a few seconds (Ctrl+C)
+python -m app.migrate --batch-size 1
+python -m app.reconcile
+```
+
+After the kill, target tables are empty (the uncommitted transaction rolled back). The second run reads the source again and finishes in the same state as an uninterrupted run.
 
 ## 2. Survive the collision (R5)
 
-Exact commands. Two terminals, same machine, same DB.
+Two terminals, same Postgres.
 
 **Terminal A**
 
@@ -54,7 +58,7 @@ python -m app.reset
 python -m app.migrate --batch-size 1 --delay-seconds 3
 ```
 
-**Terminal B** — run as soon as A is sleeping (do not wait for A to finish):
+**Terminal B** — while A is still running (do not wait for A to finish):
 
 ```powershell
 python -m app.live_update --legacy-id 1010 --status Lost
@@ -68,7 +72,7 @@ python -m app.reconcile
 
 Lead 1010 must be `Lost`, not `Closed Won`.
 
-Same thing over HTTP if you prefer:
+HTTP equivalent of the live path:
 
 ```powershell
 python -m uvicorn app.main:app --port 8000
@@ -84,12 +88,10 @@ curl -X POST http://127.0.0.1:8000/api/leads/1010/update -H "Content-Type: appli
 python -m app.reconcile
 ```
 
-Expect **8 migrated + 1 merged + 3 quarantined = 12**. If the buckets do not sum to 12, a row was dropped.
+Expect **8 migrated + 1 merged + 3 quarantined = 12**.
 
 ## Optional checks
 
 ```powershell
 python -m pytest tests -q
 ```
-
-Automated tests were cut from the revised brief. They are here only so R3/R5 can be re-run without two terminals.
