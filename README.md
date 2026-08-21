@@ -7,7 +7,8 @@ This is the **revised 3-hour** scope: schemas + seed, resumable migration, one l
 ## Setup
 
 ```powershell
-cd C:\Users\91902\Projects\lyka-one-erp
+git clone https://github.com/Shalmankursheeth/Lyka-One-ERP.git
+cd Lyka-One-ERP
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt

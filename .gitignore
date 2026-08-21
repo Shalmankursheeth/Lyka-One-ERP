@@ -9,3 +9,5 @@ data/*.db-shm
 _cutover_data/
 .idea/
 .vscode/
+collision_migrate*.log
+collision_migrate.pid
